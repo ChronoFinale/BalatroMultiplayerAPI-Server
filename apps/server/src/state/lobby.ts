@@ -17,7 +17,6 @@ export class Lobby {
 	public metadata: Record<string, unknown> = {}
 	public readonly createdAt: Date
 	public readonly messageBuffer: BufferedMessage[] = []
-	public isReported: boolean = false
 
 	constructor(
 		public readonly code: string,
