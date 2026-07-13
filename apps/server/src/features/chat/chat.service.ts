@@ -1,8 +1,22 @@
-import { RegExpMatcher, englishDataset, englishRecommendedTransformers } from 'obscenity'
+import {
+	RegExpMatcher,
+	englishDataset,
+	englishRecommendedTransformers,
+} from 'obscenity'
+import {
+	insertFlaggedMessage,
+	insertReportedLobbyMessage,
+} from '../../infrastructure/gateways/chat.gateway.js'
+import { mqttService } from '../../infrastructure/mqtt/mqtt.service.js'
 import { getConfig } from '../../state/config.js'
 import type { Lobby } from '../../state/lobby.js'
-import { mqttService } from '../../infrastructure/mqtt/mqtt.service.js'
-import { insertFlaggedMessage, insertReportedLobbyMessage } from '../../infrastructure/gateways/chat.gateway.js'
+import {
+	type ModerationClientOptions,
+	type OutagePolicy,
+	moderateRemote,
+	moderationConfigFromEnv,
+	outagePolicyFromEnv,
+} from './moderation.client.js'
 
 // --- Message normalization (for allowlist lookup only) ---
 // The original message is always what gets published and logged.
@@ -63,7 +77,9 @@ async function moderateMessage(
 	if (raw.length === 0) return { allowed: true }
 
 	const matches: MatchRecord[] = raw.map((m) => ({
-		word: englishDataset.getPayloadWithPhraseMetadata(m).phraseMetadata?.originalWord ?? '',
+		word:
+			englishDataset.getPayloadWithPhraseMetadata(m).phraseMetadata
+				?.originalWord ?? '',
 		startIndex: m.startIndex,
 		endIndex: m.endIndex,
 	}))
@@ -75,30 +91,98 @@ async function moderateMessage(
 
 // --- Main export ---
 
+export type ChatResult = {
+	ok: boolean
+	reason?: string
+	retryAfterMs?: number
+	mutedUntil?: string
+	// Set only when moderation rewrote the message: the text other players
+	// actually received. Lets the sender's client show what was delivered.
+	publishText?: string
+}
+
 export async function processAndPublishMessage(
 	lobby: Lobby,
 	playerId: string,
 	displayName: string,
 	message: string,
-): Promise<{ ok: boolean; reason?: string }> {
+	// Injectable for tests; production reads env. null = legacy local pipeline.
+	moderation: ModerationClientOptions | null = moderationConfigFromEnv(),
+	outagePolicy: OutagePolicy = outagePolicyFromEnv(),
+): Promise<ChatResult> {
 	// Reject whitespace-only messages
 	const normalized = normalizeForAllowlist(message)
 	if (normalized === null) {
 		return { ok: false, reason: 'empty' }
 	}
 
-	if (!isAllowlisted(message)) {
+	// What actually gets published. Defaults to the original; the moderation
+	// service may return a rewritten form (publishText) that we publish instead
+	// so the raw wording never reaches other players.
+	let publishMessage = message
+
+	if (moderation) {
+		// Moderation service path (ADR-1): the service runs every content tier
+		// (allowlist, blocklist, PII, ML, mutes, rate limit); we publish on allow.
+		const result = await moderateRemote(
+			{ playerId, displayName, lobbyCode: lobby.code, message },
+			moderation,
+		)
+
+		if (result.status === 'unreachable') {
+			// Fail closed (ADR-3). 'presets' outage policy still allows the
+			// curated allowlist — safe by construction, moderation not needed.
+			if (outagePolicy === 'presets' && isAllowlisted(message)) {
+				// fall through to publish below
+			} else {
+				return { ok: false, reason: 'moderation_unavailable' }
+			}
+		} else if (result.status === 'shed') {
+			return { ok: false, reason: 'busy', retryAfterMs: result.retryAfterMs }
+		} else if (result.verdict.verdict === 'reject') {
+			const v = result.verdict
+			if (v.band === 'muted') {
+				return { ok: false, reason: 'muted', mutedUntil: v.mutedUntil }
+			}
+			if (v.band === 'rate_limited') {
+				return {
+					ok: false,
+					reason: 'rate_limited',
+					retryAfterMs: v.retryAfterMs,
+				}
+			}
+			return { ok: false, reason: 'moderated' }
+		}
+		// Allowed. Honor any rewrite the service applied (publishText); on the
+		// fail-closed presets fall-through result.status is 'unreachable', so
+		// the original stands.
+		if (result.status === 'verdict' && result.verdict.publishText) {
+			publishMessage = result.verdict.publishText
+		}
+	} else if (!isAllowlisted(message)) {
+		// Legacy local pipeline (no moderation service configured).
 		const result = await moderateMessage(message, playerId)
 		if (!result.allowed) {
 			return { ok: false, reason: 'moderated' }
 		}
 	}
 
-	// Publish original message (user's casing/punctuation) via system MQTT client
-	await mqttService.publishChatMessage(lobby.code, playerId, displayName, message)
+	// Publish the moderated message (rewritten form if the service produced one,
+	// else the user's original casing/punctuation) via system MQTT client.
+	await mqttService.publishChatMessage(
+		lobby.code,
+		playerId,
+		displayName,
+		publishMessage,
+	)
 
 	const sentAt = new Date()
-	lobby.bufferMessage({ playerId, displayName, message, sentAt })
+	lobby.bufferMessage({
+		playerId,
+		displayName,
+		message: publishMessage,
+		sentAt,
+	})
 
 	// If this lobby is under an active report, persist the message immediately
 	if (lobby.isReported) {
@@ -107,10 +191,13 @@ export async function processAndPublishMessage(
 			lobbyCode: lobby.code,
 			playerId,
 			displayName,
-			message,
+			message: publishMessage,
 			sentAt,
 		})
 	}
 
-	return { ok: true }
+	return {
+		ok: true,
+		publishText: publishMessage !== message ? publishMessage : undefined,
+	}
 }

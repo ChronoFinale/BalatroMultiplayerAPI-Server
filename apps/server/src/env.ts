@@ -38,4 +38,12 @@ export const env = {
 	PLAYER_ID_SALT: required('PLAYER_ID_SALT'),
 
 	ADMIN_SECRET: required('ADMIN_SECRET'),
+
+	// Moderation service (ADR-1). Unset URL = legacy local pipeline; set it to
+	// route chat through apps/moderation. Outage policy: 'off' (chat 503s) or
+	// 'presets' (allowlist-only) when the service is unreachable (ADR-3).
+	MODERATION_SERVICE_URL: optional('MODERATION_SERVICE_URL', ''),
+	MODERATION_BEARER_TOKEN: optional('MODERATION_BEARER_TOKEN', ''),
+	MODERATION_TIMEOUT_MS: Number(optional('MODERATION_TIMEOUT_MS', '1500')),
+	MODERATION_OUTAGE_POLICY: optional('MODERATION_OUTAGE_POLICY', 'off'),
 } as const

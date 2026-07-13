@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import jwt from 'jsonwebtoken'
 import { env } from '../../env.js'
 import {
@@ -278,6 +278,10 @@ export async function authenticateWithPlayerId(
 
 export function authenticateAsTemp(steamName: string) {
 	const session = createSession(steamName)
+	// Dev/temp accounts skip the age gate: chat is enabled from the start so
+	// local testing never trips the permanent under-16 block. The /auth/dev
+	// endpoint is 404 in production, so this can never apply to real players.
+	session.chatEnabled = true
 	const token = signJwt({
 		playerId: session.playerId,
 		steamName: session.steamName,
@@ -309,7 +313,20 @@ export async function impersonatePlayer(opts: {
 	discordId?: string
 	steamName?: string
 }): Promise<SessionAndToken> {
-	const dbPlayer = await findImpersonationTarget(opts)
+	let dbPlayer = await findImpersonationTarget(opts)
+	if (!dbPlayer && opts.steamName) {
+		// Dev-only upsert (the route 404s in production): an unknown steamName
+		// becomes a real, queueable account on the fly, so local multi-client
+		// testing needs no seeding step. ToS is pre-accepted so throwaway
+		// accounts skip the prompt; id-based lookups still 404 on a miss.
+		const { tosVersion } = getConfig()
+		dbPlayer = await playerDb.createPlayer({
+			id: randomUUID(),
+			steamName: opts.steamName,
+		})
+		await playerDb.updateTosAcceptedVersion(dbPlayer.id, tosVersion)
+		dbPlayer.tosAcceptedVersion = tosVersion
+	}
 	if (!dbPlayer) throw new AppError('Player not found', 404)
 
 	const session = createSession(

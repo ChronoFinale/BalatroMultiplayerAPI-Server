@@ -1,10 +1,17 @@
 import { Router } from 'express'
-import { authenticate } from '../../middleware/authenticate.js'
-import * as lobbyService from './lobby.service.js'
-import { processAndPublishMessage } from '../chat/chat.service.js'
 import { submitReport } from '../../infrastructure/gateways/report.gateway.js'
-import { getLobby, getSession } from '../../state/index.js'
+import { authenticate } from '../../middleware/authenticate.js'
 import { AppError } from '../../shared/utils/errors.js'
+import { getLobby, getSession } from '../../state/index.js'
+import { processAndPublishMessage } from '../chat/chat.service.js'
+import {
+	appealRemote,
+	listHeldRemote,
+	moderationConfigFromEnv,
+	muteSignalRemote,
+	reportRemote,
+} from '../chat/moderation.client.js'
+import * as lobbyService from './lobby.service.js'
 
 const router = Router()
 
@@ -21,10 +28,7 @@ router.post('/', async (req, res, next) => {
 			maxPlayers !== undefined &&
 			(!Number.isInteger(maxPlayers) || maxPlayers < 2 || maxPlayers > 128)
 		) {
-			throw new AppError(
-				'maxPlayers must be an integer between 2 and 128',
-				400,
-			)
+			throw new AppError('maxPlayers must be an integer between 2 and 128', 400)
 		}
 
 		const { lobby, token } = await lobbyService.createLobby(
@@ -135,7 +139,8 @@ router.post('/:code/chat', async (req, res, next) => {
 
 		const lobby = getLobby(code)
 		if (!lobby) throw new AppError('Lobby not found', 404)
-		if (!lobby.hasPlayer(session.playerId)) throw new AppError('Not a member of this lobby', 403)
+		if (!lobby.hasPlayer(session.playerId))
+			throw new AppError('Not a member of this lobby', 403)
 
 		const { message } = req.body
 		if (!message || typeof message !== 'string') {
@@ -146,15 +151,42 @@ router.post('/:code/chat', async (req, res, next) => {
 		}
 
 		const displayName = session.getDisplayName()
-		const result = await processAndPublishMessage(lobby, session.playerId, displayName, message)
+		const result = await processAndPublishMessage(
+			lobby,
+			session.playerId,
+			displayName,
+			message,
+		)
 
 		if (!result.ok) {
-			if (result.reason === 'empty') throw new AppError('Message cannot be empty', 400)
-			if (result.reason === 'moderated') throw new AppError('Message was rejected by moderation', 403)
+			if (result.reason === 'empty')
+				throw new AppError('Message cannot be empty', 400)
+			if (result.reason === 'moderated')
+				throw new AppError('Message was rejected by moderation', 403)
+			if (result.reason === 'muted') {
+				throw new AppError(
+					result.mutedUntil
+						? `You are muted until ${result.mutedUntil}`
+						: 'You are muted',
+					403,
+				)
+			}
+			if (result.reason === 'rate_limited' || result.reason === 'busy') {
+				res.setHeader(
+					'Retry-After',
+					Math.ceil((result.retryAfterMs ?? 1000) / 1000),
+				)
+				throw new AppError('Slow down and try again shortly', 429)
+			}
+			if (result.reason === 'moderation_unavailable') {
+				throw new AppError('Chat is temporarily unavailable', 503)
+			}
 			throw new AppError('Failed to send message', 500)
 		}
 
-		res.json({ ok: true })
+		// publishText is present only when moderation rewrote the message — the
+		// sender's client uses it to show what other players actually received.
+		res.json({ ok: true, publishText: result.publishText })
 	} catch (err) {
 		next(err)
 	}
@@ -168,7 +200,8 @@ router.post('/:code/report', async (req, res, next) => {
 
 		const lobby = getLobby(code)
 		if (!lobby) throw new AppError('Lobby not found', 404)
-		if (!lobby.hasPlayer(session.playerId)) throw new AppError('Not a member of this lobby', 403)
+		if (!lobby.hasPlayer(session.playerId))
+			throw new AppError('Not a member of this lobby', 403)
 
 		const { reportedPlayerId, type, message } = req.body
 
@@ -178,13 +211,119 @@ router.post('/:code/report', async (req, res, next) => {
 		if (!type || typeof type !== 'string' || type.length > 64) {
 			throw new AppError('Missing or invalid type (max 64 characters)', 400)
 		}
-		if (message !== undefined && (typeof message !== 'string' || message.length > 500)) {
+		if (
+			message !== undefined &&
+			(typeof message !== 'string' || message.length > 500)
+		) {
 			throw new AppError('Invalid message (max 500 characters)', 400)
 		}
 
 		await submitReport(lobby, session.playerId, reportedPlayerId, type, message)
 
+		// Also surface the report in the moderation review queue + Discord.
+		// Best-effort: the relay's own `reports` table is the record, so a
+		// moderation-service outage never fails the player's report.
+		const modConfig = moderationConfigFromEnv()
+		if (modConfig) {
+			await reportRemote(
+				{
+					reporterId: session.playerId,
+					reportedPlayerId,
+					lobbyCode: code,
+					message: message ?? `(reported: ${type})`,
+					reason: type,
+				},
+				modConfig,
+			)
+		}
+
 		res.json({ ok: true })
+	} catch (err) {
+		next(err)
+	}
+})
+
+// A player contests their own message that moderation held. Feeds the review
+// queue (band=appeal). The held message text comes from the client.
+router.post('/:code/appeal', async (req, res, next) => {
+	try {
+		const { code } = req.params
+		const session = getSession(req.player!.playerId)
+		if (!session) throw new AppError('Session not found', 401)
+
+		const { message, originalBand } = req.body
+		if (!message || typeof message !== 'string' || message.length > 500) {
+			throw new AppError('Missing or invalid message (max 500 characters)', 400)
+		}
+		if (
+			originalBand !== undefined &&
+			(typeof originalBand !== 'string' || originalBand.length > 32)
+		) {
+			throw new AppError('Invalid originalBand', 400)
+		}
+
+		const modConfig = moderationConfigFromEnv()
+		if (!modConfig) throw new AppError('Appeals are unavailable', 503)
+		const result = await appealRemote(
+			{ playerId: session.playerId, lobbyCode: code, message, originalBand },
+			modConfig,
+		)
+		if (!result.ok) throw new AppError('Could not submit appeal', 502)
+
+		res.json({ ok: true, appealId: result.data.appealId })
+	} catch (err) {
+		next(err)
+	}
+})
+
+// A player muted another (client-side, per-match). We forward only the
+// aggregate signal so moderation can auto-review a player many people mute.
+// Best-effort: a failure never affects the client's local mute.
+router.post('/:code/mute', async (req, res, next) => {
+	try {
+		const { code } = req.params
+		const session = getSession(req.player!.playerId)
+		if (!session) throw new AppError('Session not found', 401)
+
+		const { mutedPlayerId } = req.body
+		if (!mutedPlayerId || typeof mutedPlayerId !== 'string') {
+			throw new AppError('Missing or invalid mutedPlayerId', 400)
+		}
+		if (mutedPlayerId === session.playerId) {
+			throw new AppError('Cannot mute yourself', 400)
+		}
+
+		const modConfig = moderationConfigFromEnv()
+		if (modConfig) {
+			await muteSignalRemote(
+				{ muterId: session.playerId, mutedPlayerId, lobbyCode: code },
+				modConfig,
+			)
+		}
+
+		res.json({ ok: true })
+	} catch (err) {
+		next(err)
+	}
+})
+
+// The post-game appeal screen: the player's own held (blocked) messages.
+router.get('/:code/held', async (req, res, next) => {
+	try {
+		const { code } = req.params
+		const session = getSession(req.player!.playerId)
+		if (!session) throw new AppError('Session not found', 401)
+
+		const modConfig = moderationConfigFromEnv()
+		if (!modConfig) {
+			res.json({ held: [] })
+			return
+		}
+		const result = await listHeldRemote(
+			{ playerId: session.playerId, lobbyCode: code },
+			modConfig,
+		)
+		res.json({ held: result.ok ? result.data.held : [] })
 	} catch (err) {
 		next(err)
 	}
