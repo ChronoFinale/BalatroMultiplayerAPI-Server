@@ -16,6 +16,15 @@ function optionalBool(key: string, defaultValue: boolean): boolean {
 	return value === 'true' || value === '1'
 }
 
+// Guards '' -> 0 and non-numeric input -> NaN, either of which would make
+// every request abort immediately if used as a timeout unchecked.
+function optionalPositiveInt(key: string, defaultValue: number): number {
+	const value = process.env[key]
+	if (!value) return defaultValue
+	const parsed = Number(value)
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : defaultValue
+}
+
 const NODE_ENV = optional('NODE_ENV', 'development')
 const IS_PRODUCTION = NODE_ENV === 'production'
 
@@ -64,4 +73,14 @@ export const env = {
 	// When true, only players holding the 'tester' privilege may create lobbies or
 	// queue for matches. Everyone else is rejected. Off by default.
 	TESTING_MODE: optionalBool('TESTING_MODE', false),
+
+	// Chat moderation bridge. Unset (default) means dormant — chat keeps using the
+	// local obscenity filter, unchanged. Set MODERATION_SERVICE_URL to route chat
+	// through an external moderation service instead.
+	MODERATION_SERVICE_URL: optional('MODERATION_SERVICE_URL', '').replace(
+		/\/+$/,
+		'',
+	),
+	MODERATION_BEARER_TOKEN: optional('MODERATION_BEARER_TOKEN', ''),
+	MODERATION_TIMEOUT_MS: optionalPositiveInt('MODERATION_TIMEOUT_MS', 1500),
 } as const

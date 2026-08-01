@@ -1,7 +1,10 @@
+import { env } from '../../env.js'
+import { insertReportedLobbyMessage } from '../../infrastructure/gateways/chat.gateway.js'
+import { callModerationService } from '../../infrastructure/gateways/moderation.gateway.js'
+import { mqttService } from '../../infrastructure/mqtt/mqtt.service.js'
 import { getConfig } from '../../state/config.js'
 import type { Lobby } from '../../state/lobby.js'
-import { mqttService } from '../../infrastructure/mqtt/mqtt.service.js'
-import { insertReportedLobbyMessage } from '../../infrastructure/gateways/chat.gateway.js'
+import { decideModerationOutcome } from './moderation.js'
 import { normalizeForAllowlist } from './normalization.js'
 import { moderateMessage } from './obscenity.js'
 
@@ -22,14 +25,41 @@ export async function processAndPublishMessage(
 		return { ok: false, reason: 'empty' }
 	}
 
+	// textToPublish may be rewritten by the moderation service; message (the
+	// original typed text) always goes to the evidence buffer/report DB — a
+	// rewrite must never launder what the player actually typed.
+	let textToPublish = message
+
 	if (!isAllowlisted(message)) {
-		const result = await moderateMessage(message, playerId)
-		if (!result.allowed) {
-			return { ok: false, reason: 'moderated' }
+		// Dormant when MODERATION_SERVICE_URL is unset — chat keeps using the
+		// local obscenity filter, unchanged. A plain property read on the
+		// already-parsed env object, so re-reading it per message costs nothing.
+		if (env.MODERATION_SERVICE_URL) {
+			const attempt = await callModerationService({
+				playerId,
+				displayName,
+				lobbyCode: lobby.code,
+				message,
+			})
+			const outcome = decideModerationOutcome(attempt)
+			if (!outcome.allowed) {
+				return { ok: false, reason: outcome.reason }
+			}
+			textToPublish = outcome.publishText ?? message
+		} else {
+			const result = await moderateMessage(message, playerId)
+			if (!result.allowed) {
+				return { ok: false, reason: 'moderated' }
+			}
 		}
 	}
 
-	await mqttService.publishChatMessage(lobby.code, playerId, displayName, message)
+	await mqttService.publishChatMessage(
+		lobby.code,
+		playerId,
+		displayName,
+		textToPublish,
+	)
 
 	const sentAt = new Date()
 	lobby.bufferMessage({ playerId, displayName, message, sentAt })
