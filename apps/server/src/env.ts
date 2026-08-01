@@ -82,5 +82,9 @@ export const env = {
 		'',
 	),
 	MODERATION_BEARER_TOKEN: optional('MODERATION_BEARER_TOKEN', ''),
-	MODERATION_TIMEOUT_MS: optionalPositiveInt('MODERATION_TIMEOUT_MS', 1500),
+	// Must exceed the moderation service's own judgement deadline plus margin.
+	// Set below it and a slow-but-successful verdict is abandoned here while it
+	// still occupies the service's single model lane, so the player sees an
+	// outage and their retry deepens the backlog that caused it.
+	MODERATION_TIMEOUT_MS: optionalPositiveInt('MODERATION_TIMEOUT_MS', 6000),
 } as const

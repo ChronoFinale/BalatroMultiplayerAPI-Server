@@ -31,17 +31,14 @@ function isModerationResponseBody(
 
 // Any transport failure, non-200 status, unparseable body, or unrecognised
 // verdict shape fails closed as 'unavailable' — never allow on uncertainty.
-// Rate limiting can be signalled two ways: a conventional HTTP 429 (checked
-// first, regardless of body shape), or a 200 with {verdict:'reject',
-// band:'rate_limited'} below — both converge on the same outcome.
+// That deliberately includes HTTP 429: the service sheds load globally with
+// that status, which is a capacity problem, not this player sending too fast.
+// Per-player rate limiting arrives as 200 + {verdict:'reject',
+// band:'rate_limited'} and is the only thing told to slow down.
 // Unknown/future reject bands fail closed as the generic 'moderated' block.
 export function decideModerationOutcome(
 	attempt: ModerationAttempt,
 ): ModerationOutcome {
-	if (attempt !== null && attempt.status === 429) {
-		return { allowed: false, reason: 'rate_limited' }
-	}
-
 	if (
 		attempt === null ||
 		attempt.status !== 200 ||

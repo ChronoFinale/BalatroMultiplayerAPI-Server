@@ -38,20 +38,23 @@ describe('moderation.decideModerationOutcome', () => {
 		).toEqual({ allowed: false, reason: 'rate_limited' })
 	})
 
-	it('blocks with reason rate_limited for a conventional HTTP 429, regardless of body shape', () => {
+	// HTTP 429 is the service shedding load globally. Reporting it as
+	// rate_limited would tell a player who sent one message that they are
+	// chatting too fast, because someone else flooded the service.
+	it('treats an HTTP 429 as a service outage, not as the player being too fast', () => {
 		expect(
 			decideModerationOutcome({ status: 429, body: { verdict: 'allow' } }),
-		).toEqual({ allowed: false, reason: 'rate_limited' })
+		).toEqual({ allowed: false, reason: 'unavailable' })
 		expect(decideModerationOutcome({ status: 429, body: null })).toEqual({
 			allowed: false,
-			reason: 'rate_limited',
+			reason: 'unavailable',
 		})
 		expect(
 			decideModerationOutcome({
 				status: 429,
 				body: '<html>too many requests</html>',
 			}),
-		).toEqual({ allowed: false, reason: 'rate_limited' })
+		).toEqual({ allowed: false, reason: 'unavailable' })
 	})
 
 	it.each(['threat_block', 'blocklist', 'safety_block', 'guard_block'])(
