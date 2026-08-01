@@ -166,7 +166,9 @@ describe('chat.service.processAndPublishMessage', () => {
 				'fuck you',
 			)
 
-			expect(result).toEqual({ ok: true })
+			// The sender is told what was actually delivered, so the client can
+			// show "sent as ..." instead of the rewrite being silent.
+			expect(result).toEqual({ ok: true, publishText: '**** you' })
 			// MQTT gets the rewritten text...
 			expect(mqttService.publishChatMessage).toHaveBeenCalledWith(
 				'ABC123',

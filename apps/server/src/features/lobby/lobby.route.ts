@@ -172,7 +172,7 @@ export function createLobbyRouter(service: LobbyService): Router {
 				throw new AppError('Failed to send message', 500)
 			}
 
-			res.json({ ok: true })
+			res.json(result.publishText ? { ok: true, publishText: result.publishText } : { ok: true })
 		} catch (err) {
 			next(err)
 		}

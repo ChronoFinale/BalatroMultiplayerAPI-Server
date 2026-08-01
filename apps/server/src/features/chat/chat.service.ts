@@ -19,7 +19,7 @@ export async function processAndPublishMessage(
 	playerId: string,
 	displayName: string,
 	message: string,
-): Promise<{ ok: boolean; reason?: string }> {
+): Promise<{ ok: boolean; reason?: string; publishText?: string }> {
 	const normalized = normalizeForAllowlist(message)
 	if (normalized === null) {
 		return { ok: false, reason: 'empty' }
@@ -75,5 +75,10 @@ export async function processAndPublishMessage(
 		})
 	}
 
+	// Only when a rewrite happened: the sender's client shows what other
+	// players actually received, so a rewrite is never silent.
+	if (textToPublish !== message) {
+		return { ok: true, publishText: textToPublish }
+	}
 	return { ok: true }
 }
