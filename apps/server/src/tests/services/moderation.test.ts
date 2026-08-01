@@ -20,13 +20,37 @@ describe('moderation.decideModerationOutcome', () => {
 		).toEqual({ allowed: true, publishText: 'cleaned up text' })
 	})
 
-	it('treats an empty-string publishText as no rewrite', () => {
+	it('blocks rather than republishing the original when the rewrite is empty', () => {
+		// A present-but-empty publishText means the service redacted the message
+		// down to nothing and still allowed it. Falling back to the original
+		// text here would republish exactly what the rewrite removed.
 		expect(
 			decideModerationOutcome({
 				status: 200,
 				body: { verdict: 'allow', publishText: '' },
 			}),
-		).toEqual({ allowed: true, publishText: null })
+		).toEqual({ allowed: false, reason: 'moderated', band: 'unusable_rewrite' })
+	})
+
+	it('blocks rather than republishing the original when the rewrite is whitespace-only', () => {
+		expect(
+			decideModerationOutcome({
+				status: 200,
+				body: { verdict: 'allow', publishText: '   ' },
+			}),
+		).toEqual({ allowed: false, reason: 'moderated', band: 'unusable_rewrite' })
+	})
+
+	it('blocks rather than republishing the original when publishText has the wrong type', () => {
+		// A rewrite was intended and is unreadable — that is closer to "reject"
+		// than to "service is down", so this degrades to a plain block rather
+		// than 'unavailable'.
+		expect(
+			decideModerationOutcome({
+				status: 200,
+				body: { verdict: 'allow', publishText: 42 },
+			}),
+		).toEqual({ allowed: false, reason: 'moderated', band: 'unusable_rewrite' })
 	})
 
 	it('blocks with reason rate_limited for the rate_limited band', () => {
@@ -68,6 +92,7 @@ describe('moderation.decideModerationOutcome', () => {
 			).toEqual({
 				allowed: false,
 				reason: 'moderated',
+				band,
 			})
 		},
 	)
@@ -89,7 +114,7 @@ describe('moderation.decideModerationOutcome', () => {
 				status: 200,
 				body: { verdict: 'reject', band: 'some_future_band' },
 			}),
-		).toEqual({ allowed: false, reason: 'moderated' })
+		).toEqual({ allowed: false, reason: 'moderated', band: 'some_future_band' })
 	})
 
 	it('blocks with reason moderated when a reject has no band at all', () => {
@@ -149,18 +174,38 @@ describe('moderation.decideModerationOutcome', () => {
 		})
 	})
 
-	it('fails closed as unavailable when band or publishText have the wrong type', () => {
+	// A malformed band or publishText is a cosmetic contract drift, not
+	// evidence the service is unreachable. A bad band on a reject can't cause
+	// an unsafe publish (the message is blocked either way), so it degrades to
+	// a plain block instead of taking chat down; see the publishText-type-drift
+	// cases above for the allow side.
+	it('degrades a reject with a wrong-typed band to the generic block, not unavailable', () => {
 		expect(
 			decideModerationOutcome({
 				status: 200,
 				body: { verdict: 'reject', band: 42 },
 			}),
-		).toEqual({ allowed: false, reason: 'unavailable' })
-		expect(
-			decideModerationOutcome({
-				status: 200,
-				body: { verdict: 'allow', publishText: 42 },
-			}),
-		).toEqual({ allowed: false, reason: 'unavailable' })
+		).toEqual({ allowed: false, reason: 'moderated' })
+	})
+
+	describe("the relay's own message cap (500 chars)", () => {
+		it('blocks a rewrite that exceeds the cap rather than publishing or truncating it', () => {
+			expect(
+				decideModerationOutcome({
+					status: 200,
+					body: { verdict: 'allow', publishText: 'x'.repeat(501) },
+				}),
+			).toEqual({ allowed: false, reason: 'moderated', band: 'oversized_rewrite' })
+		})
+
+		it('allows a rewrite exactly at the cap', () => {
+			const text = 'x'.repeat(500)
+			expect(
+				decideModerationOutcome({
+					status: 200,
+					body: { verdict: 'allow', publishText: text },
+				}),
+			).toEqual({ allowed: true, publishText: text })
+		})
 	})
 })

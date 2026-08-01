@@ -88,3 +88,51 @@ export const env = {
 	// outage and their retry deepens the backlog that caused it.
 	MODERATION_TIMEOUT_MS: optionalPositiveInt('MODERATION_TIMEOUT_MS', 6000),
 } as const
+
+// A bad URL and a missing bearer token both present as a silent, total chat
+// outage (every call throws, or every call gets a 401) with no signal beyond
+// a console.error per message. Called once at boot so misconfiguration is a
+// startup failure/warning instead of a mystery discovered in production chat.
+export function assertValidModerationConfig(
+	url: string,
+	bearerToken: string,
+	isProduction: boolean = IS_PRODUCTION,
+): void {
+	if (!url) {
+		console.info('[env] chat moderation bridge is OFF (no service URL set)')
+		return
+	}
+
+	// Warn rather than throw: a bad URL here would otherwise take down lobbies,
+	// matchmaking and games over a chat setting. Chat still fails closed, which
+	// is the outcome we want anyway.
+	let parsed: URL | null = null
+	try {
+		parsed = new URL(url)
+	} catch {
+		console.error(
+			`[env] MODERATION_SERVICE_URL is not a valid URL ('${url}') - chat will fail closed on every message until this is fixed`,
+		)
+		return
+	}
+	if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+		console.error(
+			`[env] MODERATION_SERVICE_URL must use http or https ('${url}') - chat will fail closed on every message until this is fixed`,
+		)
+		return
+	}
+	console.info(`[env] chat moderation bridge is ON (${parsed.origin})`)
+	if (!bearerToken) {
+		console.warn(
+			'[env] MODERATION_BEARER_TOKEN is empty while MODERATION_SERVICE_URL is set - the moderation service may reject every request with 401',
+		)
+	}
+	// The bearer token crosses the wire on every call. A warning, not a hard
+	// failure — plaintext http may be intentional (e.g. a same-host/VPN-only
+	// service), so this flags the risk without blocking startup.
+	if (parsed.protocol === 'http:' && isProduction) {
+		console.warn(
+			`[env] MODERATION_SERVICE_URL uses plaintext http in production ('${url}') - the bearer token crosses the wire unencrypted`,
+		)
+	}
+}

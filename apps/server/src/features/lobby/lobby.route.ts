@@ -167,8 +167,8 @@ export function createLobbyRouter(service: LobbyService): Router {
 			if (!result.ok) {
 				if (result.reason === 'empty') throw new AppError('Message cannot be empty', 400)
 				if (result.reason === 'moderated') throw new AppError('Message was rejected by moderation', 403)
-				if (result.reason === 'rate_limited') throw new AppError("Message not sent - you're chatting too fast. Wait a few seconds and try again.", 429)
-				if (result.reason === 'unavailable') throw new AppError('Message not sent - chat moderation is unavailable. Try again in a moment.', 503)
+				if (result.reason === 'rate_limited') throw new AppError("You're chatting too fast. Wait a few seconds.", 429)
+				if (result.reason === 'unavailable') throw new AppError('Chat moderation is unavailable. Try again in a moment.', 503)
 				throw new AppError('Failed to send message', 500)
 			}
 

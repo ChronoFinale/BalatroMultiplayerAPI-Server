@@ -1,11 +1,13 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { env } from '../../env.js'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { processAndPublishMessage } from '../../features/chat/chat.service.js'
 import type { ModerationAttempt } from '../../features/chat/moderation.js'
 import { normalizeForAllowlist } from '../../features/chat/normalization.js'
 import { moderateMessage } from '../../features/chat/obscenity.js'
 import { db } from '../../infrastructure/db/index.js'
-import { callModerationService } from '../../infrastructure/gateways/moderation.gateway.js'
+import {
+	callModerationService,
+	isModerationBridgeEnabled,
+} from '../../infrastructure/gateways/moderation.gateway.js'
 import { mqttService } from '../../infrastructure/mqtt/mqtt.service.js'
 import { setConfig } from '../../state/config.js'
 import { Lobby } from '../../state/lobby.js'
@@ -16,16 +18,12 @@ vi.mock('../../features/chat/obscenity.js', () => ({
 
 vi.mock('../../infrastructure/gateways/moderation.gateway.js', () => ({
 	callModerationService: vi.fn(),
+	isModerationBridgeEnabled: vi.fn(),
 }))
 
 const mockModerateMessage = vi.mocked(moderateMessage)
 const mockCallModerationService = vi.mocked(callModerationService)
-
-// env.ts's readonly typing is TS-only (no runtime freeze); tests flip the
-// moderation-bridge flag directly rather than threading a test-only param
-// through processAndPublishMessage.
-const mutableEnv = env as { MODERATION_SERVICE_URL: string }
-const originalModerationServiceUrl = env.MODERATION_SERVICE_URL
+const mockIsModerationBridgeEnabled = vi.mocked(isModerationBridgeEnabled)
 
 function makeLobby(): Lobby {
 	return new Lobby('ABC123', 'mod1', 'host1')
@@ -34,11 +32,7 @@ function makeLobby(): Lobby {
 describe('chat.service.processAndPublishMessage', () => {
 	beforeEach(() => {
 		mockModerateMessage.mockResolvedValue({ allowed: true })
-		mutableEnv.MODERATION_SERVICE_URL = ''
-	})
-
-	afterEach(() => {
-		mutableEnv.MODERATION_SERVICE_URL = originalModerationServiceUrl
+		mockIsModerationBridgeEnabled.mockReturnValue(false)
 	})
 
 	describe('dormant (MODERATION_SERVICE_URL unset, the default)', () => {
@@ -120,7 +114,7 @@ describe('chat.service.processAndPublishMessage', () => {
 		}
 
 		beforeEach(() => {
-			mutableEnv.MODERATION_SERVICE_URL = 'http://moderation.local'
+			mockIsModerationBridgeEnabled.mockReturnValue(true)
 		})
 
 		it('publishes the original text on allow', async () => {
@@ -216,6 +210,92 @@ describe('chat.service.processAndPublishMessage', () => {
 
 			expect(result).toEqual({ ok: true })
 			expect(mockCallModerationService).not.toHaveBeenCalled()
+		})
+
+		it("blocks rather than publishing or echoing a rewrite over the relay's own 500-char cap", async () => {
+			mockAttempt({
+				status: 200,
+				body: { verdict: 'allow', publishText: 'x'.repeat(501) },
+			})
+			const lobby = makeLobby()
+
+			const result = await processAndPublishMessage(lobby, 'p1', 'Alice', 'hi')
+
+			expect(result).toEqual({ ok: false, reason: 'moderated' })
+			expect(mqttService.publishChatMessage).not.toHaveBeenCalled()
+		})
+
+		// The remote service logs no message content by design, so this is the
+		// only place a remotely-blocked message is preserved as evidence.
+		describe('evidence for a remote block', () => {
+			it('records a moderated block with the band and the original typed text', async () => {
+				mockAttempt({
+					status: 200,
+					body: { verdict: 'reject', band: 'threat_block' },
+				})
+				const lobby = makeLobby()
+				const valuesMock = vi.fn().mockResolvedValue(undefined)
+				vi.mocked(db.insert).mockReturnValueOnce({
+					values: valuesMock,
+				} as never)
+
+				const result = await processAndPublishMessage(
+					lobby,
+					'p1',
+					'Alice',
+					'bad message',
+				)
+
+				expect(result).toEqual({ ok: false, reason: 'moderated' })
+				expect(valuesMock).toHaveBeenCalledWith(
+					expect.objectContaining({
+						playerId: 'p1',
+						message: 'bad message',
+						matches: { source: 'remote', band: 'threat_block' },
+					}),
+				)
+			})
+
+			it('does not write evidence for a rate_limited block', async () => {
+				mockAttempt({
+					status: 200,
+					body: { verdict: 'reject', band: 'rate_limited' },
+				})
+				const lobby = makeLobby()
+
+				await processAndPublishMessage(lobby, 'p1', 'Alice', 'hi')
+
+				expect(db.insert).not.toHaveBeenCalled()
+			})
+
+			it('does not write evidence for an unavailable block', async () => {
+				mockAttempt(null)
+				const lobby = makeLobby()
+
+				await processAndPublishMessage(lobby, 'p1', 'Alice', 'hi')
+
+				expect(db.insert).not.toHaveBeenCalled()
+			})
+
+			it('still blocks the message when the evidence write itself fails', async () => {
+				mockAttempt({
+					status: 200,
+					body: { verdict: 'reject', band: 'threat_block' },
+				})
+				const lobby = makeLobby()
+				vi.mocked(db.insert).mockImplementationOnce(() => {
+					throw new Error('db unavailable')
+				})
+
+				const result = await processAndPublishMessage(
+					lobby,
+					'p1',
+					'Alice',
+					'bad message',
+				)
+
+				expect(result).toEqual({ ok: false, reason: 'moderated' })
+			})
 		})
 	})
 })

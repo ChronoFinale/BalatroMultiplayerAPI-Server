@@ -14,18 +14,29 @@ export type ModerationServiceConfig = {
 	timeoutMs: number
 }
 
-// Read once at module load, not per message.
-const defaultConfig: ModerationServiceConfig = {
-	url: env.MODERATION_SERVICE_URL,
-	bearerToken: env.MODERATION_BEARER_TOKEN,
-	timeoutMs: env.MODERATION_TIMEOUT_MS,
+// Whether the bridge is on is one seam, not two: this reads the same env
+// value used to build the default call config below, so "is it enabled" and
+// "what do we call" can never disagree.
+export function isModerationBridgeEnabled(): boolean {
+	return env.MODERATION_SERVICE_URL !== ''
+}
+
+// Evaluated fresh per call (default params re-run their expression each time
+// the arg is omitted) rather than snapshotted at module load, so it can never
+// go stale relative to isModerationBridgeEnabled() above.
+function currentConfig(): ModerationServiceConfig {
+	return {
+		url: env.MODERATION_SERVICE_URL,
+		bearerToken: env.MODERATION_BEARER_TOKEN,
+		timeoutMs: env.MODERATION_TIMEOUT_MS,
+	}
 }
 
 // Single attempt, no retries. Any network error, abort, or non-JSON body
 // comes back as null — the caller treats that as a failed-closed attempt.
 export async function callModerationService(
 	request: ModerationRequest,
-	config: ModerationServiceConfig = defaultConfig,
+	config: ModerationServiceConfig = currentConfig(),
 ): Promise<ModerationAttempt> {
 	const headers: Record<string, string> = { 'Content-Type': 'application/json' }
 	if (config.bearerToken) {

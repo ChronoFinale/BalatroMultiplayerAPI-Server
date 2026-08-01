@@ -1,6 +1,11 @@
-import { env } from '../../env.js'
-import { insertReportedLobbyMessage } from '../../infrastructure/gateways/chat.gateway.js'
-import { callModerationService } from '../../infrastructure/gateways/moderation.gateway.js'
+import {
+	insertFlaggedMessage,
+	insertReportedLobbyMessage,
+} from '../../infrastructure/gateways/chat.gateway.js'
+import {
+	callModerationService,
+	isModerationBridgeEnabled,
+} from '../../infrastructure/gateways/moderation.gateway.js'
 import { mqttService } from '../../infrastructure/mqtt/mqtt.service.js'
 import { getConfig } from '../../state/config.js'
 import type { Lobby } from '../../state/lobby.js'
@@ -8,9 +13,21 @@ import { decideModerationOutcome } from './moderation.js'
 import { normalizeForAllowlist } from './normalization.js'
 import { moderateMessage } from './obscenity.js'
 
+export type ChatBlockReason =
+	| 'empty'
+	| 'moderated'
+	| 'rate_limited'
+	| 'unavailable'
+
+export type ChatResult =
+	| { ok: true; publishText?: string }
+	| { ok: false; reason: ChatBlockReason }
+
 function isAllowlisted(message: string): boolean {
 	const key = normalizeForAllowlist(message)
 	if (key === null) return false
+	// Curation invariant (link-free, rewrite-neutral) documented at the load
+	// site: infrastructure/gateways/config.gateway.ts.
 	return getConfig().chatAllowlist.has(key)
 }
 
@@ -19,7 +36,7 @@ export async function processAndPublishMessage(
 	playerId: string,
 	displayName: string,
 	message: string,
-): Promise<{ ok: boolean; reason?: string; publishText?: string }> {
+): Promise<ChatResult> {
 	const normalized = normalizeForAllowlist(message)
 	if (normalized === null) {
 		return { ok: false, reason: 'empty' }
@@ -32,9 +49,8 @@ export async function processAndPublishMessage(
 
 	if (!isAllowlisted(message)) {
 		// Dormant when MODERATION_SERVICE_URL is unset — chat keeps using the
-		// local obscenity filter, unchanged. A plain property read on the
-		// already-parsed env object, so re-reading it per message costs nothing.
-		if (env.MODERATION_SERVICE_URL) {
+		// local obscenity filter, unchanged.
+		if (isModerationBridgeEnabled()) {
 			const attempt = await callModerationService({
 				playerId,
 				displayName,
@@ -43,6 +59,24 @@ export async function processAndPublishMessage(
 			})
 			const outcome = decideModerationOutcome(attempt)
 			if (!outcome.allowed) {
+				// The remote service logs no message content by design, and this
+				// branch bypasses the local obscenity filter's own evidence write
+				// below — without this, a remotely-blocked message would exist
+				// nowhere at all. Never blocking on it: a DB hiccup here must not
+				// turn a moderation block into a 500.
+				if (outcome.reason === 'moderated') {
+					try {
+						await insertFlaggedMessage(playerId, message, {
+							source: 'remote',
+							band: outcome.band ?? 'unknown',
+						})
+					} catch (err) {
+						console.error(
+							'[moderation] failed to record a remotely-blocked message as evidence:',
+							err,
+						)
+					}
+				}
 				return { ok: false, reason: outcome.reason }
 			}
 			textToPublish = outcome.publishText ?? message

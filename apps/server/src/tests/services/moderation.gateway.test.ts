@@ -1,9 +1,11 @@
 import http from 'node:http'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { env } from '../../env.js'
 import { decideModerationOutcome } from '../../features/chat/moderation.js'
 import {
 	type ModerationServiceConfig,
 	callModerationService,
+	isModerationBridgeEnabled,
 } from '../../infrastructure/gateways/moderation.gateway.js'
 
 const config: ModerationServiceConfig = {
@@ -169,6 +171,45 @@ describe('moderation.gateway.callModerationService', () => {
 		} finally {
 			redirector.close()
 			impostor.close()
+		}
+	})
+})
+
+describe('moderation.gateway.isModerationBridgeEnabled', () => {
+	// env.ts's readonly typing is TS-only (no runtime freeze).
+	const mutableEnv = env as { MODERATION_SERVICE_URL: string }
+	const originalUrl = env.MODERATION_SERVICE_URL
+
+	afterEach(() => {
+		mutableEnv.MODERATION_SERVICE_URL = originalUrl
+	})
+
+	it('is false when MODERATION_SERVICE_URL is unset', () => {
+		mutableEnv.MODERATION_SERVICE_URL = ''
+		expect(isModerationBridgeEnabled()).toBe(false)
+	})
+
+	it('is true when MODERATION_SERVICE_URL is set, and the default call config agrees', async () => {
+		mutableEnv.MODERATION_SERVICE_URL = 'http://moderation.local'
+		expect(isModerationBridgeEnabled()).toBe(true)
+
+		// The default config is re-read live, from the same value, so a caller
+		// that only checks isModerationBridgeEnabled() can never end up calling
+		// out to a stale/empty URL.
+		const originalFetch = global.fetch
+		global.fetch = vi
+			.fn()
+			.mockResolvedValue(
+				new Response(JSON.stringify({ verdict: 'allow' }), { status: 200 }),
+			)
+		try {
+			await callModerationService(request)
+			expect(global.fetch).toHaveBeenCalledWith(
+				'http://moderation.local/moderate',
+				expect.anything(),
+			)
+		} finally {
+			global.fetch = originalFetch
 		}
 	})
 })
