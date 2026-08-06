@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import {
 	createSession,
 	findByProvider,
@@ -27,6 +28,10 @@ export type AuthService = ReturnType<typeof createAuthService>
 
 export function authenticateAsTemp(steamName: string) {
 	const session = createSession(steamName)
+	// Dev/temp accounts skip the age gate so local testing never trips the
+	// permanent under-16 chat block. /api/auth/dev is 404 in production, so
+	// this cannot reach a real player.
+	session.chatEnabled = true
 	const token = signJwt({
 		playerId: session.playerId,
 		steamName: session.steamName,
@@ -236,7 +241,26 @@ export function createAuthService(deps: AuthServiceDeps) {
 		discordId?: string
 		steamName?: string
 	}): Promise<SessionAndToken> {
-		const dbPlayer = await findImpersonationTarget(opts)
+		let dbPlayer = await findImpersonationTarget(opts)
+		if (!dbPlayer && opts.steamName) {
+			// Dev-only upsert - the route this reaches 404s in production. An
+			// unknown steamName becomes a real, queueable account on the fly so
+			// local multi-client testing needs no seeding step against a fresh
+			// database. ToS is pre-accepted so throwaway accounts skip the
+			// prompt; id-based lookups still 404 on a miss.
+			dbPlayer = await playerRepository.createPlayer({
+				id: randomUUID(),
+				steamName: opts.steamName,
+			})
+			const { tosVersion } = getConfig()
+			await playerRepository.updateTosAcceptedVersion(dbPlayer.id, tosVersion)
+			dbPlayer.tosAcceptedVersion = tosVersion
+			// Chat on by default for these too: the age gate exists to protect
+			// real players, and making every throwaway dev account click
+			// through it just makes chat testing tedious.
+			await playerRepository.updateChatStatus(dbPlayer.id, true, false)
+			dbPlayer.chatEnabled = true
+		}
 		if (!dbPlayer) throw new AppError('Player not found', 404)
 
 		const session = createSession(
